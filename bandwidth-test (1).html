@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bandwidth Test</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --text: #14181f; --muted: #5d6675;
+    --line: #d9dde4; --go: #0a7d4f; --stop: #c2322b; --accent: #1456d6;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --panel: #1b2027; --text: #eceff4; --muted: #9aa3b2;
+      --line: #2c333d; --go: #3ecf8e; --stop: #ff6b61; --accent: #6ea2ff;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 520px; margin: 0 auto; padding: 24px 16px 40px; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .total { font-size: clamp(2.6rem, 14vw, 4rem); font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.05; }
+  .total small { font-size: .4em; font-weight: 500; color: var(--muted); margin-left: 6px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .stats div { border-top: 1px solid var(--line); padding-top: 8px; }
+  .stats span { display: block; font-size: .78rem; color: var(--muted); }
+  .stats b { font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+  .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0; }
+  button { font: inherit; font-weight: 600; font-size: 1.1rem; padding: 18px 8px; border-radius: 12px;
+    border: 0; cursor: pointer; color: #fff; min-height: 56px; }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  #start { background: var(--go); } #stop { background: var(--stop); }
+  #start { color: #04130c; } @media (prefers-color-scheme: light) { #start { color: #fff; } }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  .opts { display: grid; gap: 12px; margin-top: 4px; }
+  label { display: grid; gap: 4px; font-size: .85rem; color: var(--muted); }
+  input[type=text], input[type=number] { font: inherit; padding: 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--text); width: 100%; }
+  #status { margin-top: 12px; font-size: .85rem; color: var(--muted); min-height: 1.3em; }
+  p.note { font-size: .8rem; color: var(--muted); margin: 16px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bandwidth test</h1>
+
+  <section class="panel" aria-live="off">
+    <div class="total"><span id="total">0.00</span><small id="unit">MB</small></div>
+    <div class="stats">
+      <div><span>Speed</span><b id="speed">0 Mbps</b></div>
+      <div><span>Peak</span><b id="peak">0 Mbps</b></div>
+      <div><span>Elapsed</span><b id="elapsed">0:00</b></div>
+    </div>
+    <div id="status" role="status">Idle.</div>
+  </section>
+
+  <div class="buttons">
+    <button id="start">Start test</button>
+    <button id="stop" disabled>Stop test</button>
+  </div>
+
+  <section class="panel opts">
+    <label>Parallel streams
+      <input id="streams" type="number" min="1" max="16" value="6" inputmode="numeric">
+    </label>
+    <label>Auto-stop after (GB, 0 = never)
+      <input id="cap" type="number" min="0" step="0.5" value="0" inputmode="decimal">
+    </label>
+    <label>Test file URL (must send CORS headers)
+      <input id="url" type="text" value="https://speed.cloudflare.com/__down?bytes=25000000" spellcheck="false" autocapitalize="off">
+    </label>
+  </section>
+
+  <p class="note">Data streams into RAM, is counted, and is discarded immediately. Nothing is written to disk.
+  Each request carries a unique cache-busting parameter and <code>cache: "no-store"</code>.
+  On a mobile connection this uses real data, so set an auto-stop cap.</p>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const el = { total: $('total'), unit: $('unit'), speed: $('speed'), peak: $('peak'),
+               elapsed: $('elapsed'), status: $('status'), start: $('start'), stop: $('stop'),
+               streams: $('streams'), cap: $('cap'), url: $('url') };
+
+  let controller = null, running = false, bytes = 0, t0 = 0, peak = 0,
+      errors = 0, ui = null, wakeLock = null, samples = [];
+
+  function bustUrl(base) {
+    const u = new URL(base);
+    u.searchParams.set('cb', Date.now() + '-' + Math.random().toString(36).slice(2));
+    return u.toString();
+  }
+
+  // One worker: request, read the stream chunk by chunk, count, discard, repeat.
+  async function worker(signal, base) {
+    let backoff = 500;
+    while (!signal.aborted) {
+      try {
+        const res = await fetch(bustUrl(base), {
+          cache: 'no-store', credentials: 'omit', mode: 'cors', signal
+        });
+        if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+        const reader = res.body.getReader();
+        backoff = 500;
+        for (;;) {
+          const { done, value } = await reader.read();   // chunk lives in RAM only
+          if (done) break;
+          bytes += value.byteLength;                      // count it, then let GC drop it
+        }
+      } catch (e) {
+        if (signal.aborted) return;
+        errors++;
+        el.status.textContent = 'Request failed (' + e.message + '). Retrying…';
+        await new Promise(r => setTimeout(r, backoff));
+        backoff = Math.min(backoff * 2, 8000);
+      }
+    }
+  }
+
+  function render() {
+    const now = performance.now();
+    samples.push([now, bytes]);
+    while (samples.length > 1 && now - samples[0][0] > 2000) samples.shift();
+    const [ts, bs] = samples[0];
+    const mbps = now > ts ? ((bytes - bs) * 8) / ((now - ts) / 1000) / 1e6 : 0;
+    if (mbps > peak) peak = mbps;
+
+    const mb = bytes / 1e6;
+    if (mb >= 1000) { el.total.textContent = (mb / 1000).toFixed(3); el.unit.textContent = 'GB'; }
+    else            { el.total.textContent = mb.toFixed(2);          el.unit.textContent = 'MB'; }
+    el.speed.textContent = mbps.toFixed(0) + ' Mbps';
+    el.peak.textContent  = peak.toFixed(0) + ' Mbps';
+    const s = Math.floor((now - t0) / 1000);
+    el.elapsed.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+
+    const capGB = parseFloat(el.cap.value) || 0;
+    if (capGB > 0 && bytes >= capGB * 1e9) stop('Reached the ' + capGB + ' GB cap.');
+  }
+
+  async function start() {
+    if (running) return;
+    let base;
+    try { base = new URL(el.url.value.trim()).toString(); }
+    catch { el.status.textContent = 'Enter a valid URL.'; return; }
+
+    const n = Math.max(1, Math.min(16, parseInt(el.streams.value, 10) || 6));
+    running = true; bytes = 0; peak = 0; errors = 0; samples = []; t0 = performance.now();
+    controller = new AbortController();
+    el.start.disabled = true; el.stop.disabled = false;
+    [el.streams, el.cap, el.url].forEach(i => i.disabled = true);
+    el.status.textContent = 'Running with ' + n + ' parallel streams…';
+
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    ui = setInterval(render, 250);
+    for (let i = 0; i < n; i++) worker(controller.signal, base);
+  }
+
+  function stop(msg) {
+    if (!running) return;
+    running = false;
+    controller.abort();
+    clearInterval(ui);
+    render();
+    try { wakeLock?.release(); } catch {}
+    el.start.disabled = false; el.stop.disabled = true;
+    [el.streams, el.cap, el.url].forEach(i => i.disabled = false);
+    el.status.textContent = (typeof msg === 'string' ? msg : 'Stopped.') +
+      (errors ? ' (' + errors + ' request errors)' : '');
+  }
+
+  el.start.addEventListener('click', start);
+  el.stop.addEventListener('click', () => stop());
+  document.addEventListener('visibilitychange', async () => {
+    if (running && document.visibilityState === 'visible') {
+      try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    }
+  });
+})();
+</script>
+</body>
+</html>
